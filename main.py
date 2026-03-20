@@ -2,7 +2,7 @@ import subprocess
 import shutil
 import tempfile
 import os
-from typing import Optional, Iterator, Union
+from typing import Optional, Iterator, Union, Dict, List
 from pathlib import Path
 from enum import Enum
 
@@ -24,9 +24,10 @@ class ObjdumpDisassembler:
         if not path.exists():
             raise FileNotFoundError(f"File not found: {path}")
         
-        cmd = [self.objdump_path, "-d", str(path)]
+        cmd = [self.objdump_path, "-d"]
         if extra_args:
             cmd.extend(extra_args)
+        cmd.append(str(path))
         
         try:
             result = subprocess.run(
@@ -60,9 +61,10 @@ class ObjdumpDisassembler:
         if not path.exists():
             raise FileNotFoundError(f"File not found: {path}")
         
-        cmd = [self.objdump_path, "-d", str(path)]
+        cmd = [self.objdump_path, "-d"]
         if extra_args:
             cmd.extend(extra_args)
+        cmd.append(str(path))
         
         with subprocess.Popen(
             cmd,
@@ -74,11 +76,12 @@ class ObjdumpDisassembler:
             for line in proc.stdout:
                 yield line.rstrip()
             
-            if proc.returncode and proc.returncode != 0:
+            return_code = proc.wait()
+            if return_code != 0:
                 stderr = proc.stderr.read() if proc.stderr else ""
-                raise RuntimeError(f"objdump failed (exit code {proc.returncode}): {stderr}")
+                raise RuntimeError(f"objdump failed (exit code {return_code}): {stderr}")
     
-    def get_symbols(self, path: Union[str, Path]) -> dict[str, str]:
+    def get_symbols(self, path: Union[str, Path]) -> Dict[str, str]:
         path = Path(path)
         if not path.exists():
             raise FileNotFoundError(f"File not found: {path}")
@@ -93,17 +96,52 @@ class ObjdumpDisassembler:
             )
             
             for line in result.stdout.splitlines():
-                if line and not line.startswith("SYMBOL TABLE"):
-                    parts = line.split()
-                    if len(parts) >= 4:
-                        address = parts[0]
-                        symbol_name = parts[-1]
-                        symbols[symbol_name] = address
-            return symbols
+                if not line or line.startswith("SYMBOL TABLE") or line.startswith("00000000") and "FILE" in line:
+                    continue
+                
+                parts = line.split()
+                if len(parts) >= 4:
+                    candidate_address = parts[0]
+                    candidate_symbol = parts[-1]
+                    
+                    if candidate_address.replace("0", "").replace("x", "").replace("a", "").replace("b", "").replace("c", "").replace("d", "").replace("e", "").replace("f", "").isdigit() or candidate_address == "00000000":
+                        symbols[candidate_symbol] = candidate_address
+                    
         except subprocess.CalledProcessError as e:
             raise RuntimeError(f"Failed to get symbols: {e.stderr}") from e
+        
+        return symbols
     
-    def compare_disassembly(self, path1: Union[str, Path], path2: Union[str, Path]) -> dict[str, list[str]]:
+    def get_dynamic_symbols(self, path: Union[str, Path]) -> Dict[str, str]:
+        path = Path(path)
+        if not path.exists():
+            raise FileNotFoundError(f"File not found: {path}")
+        
+        symbols = {}
+        try:
+            result = subprocess.run(
+                [self.objdump_path, "-T", str(path)],
+                capture_output=True,
+                text=True,
+                check=True
+            )
+            
+            for line in result.stdout.splitlines():
+                if not line or "no symbols" in line.lower():
+                    continue
+                
+                parts = line.split()
+                if len(parts) >= 5 and "DF" in line:
+                    symbol_name = parts[-1]
+                    address = parts[0] if parts[0].startswith("0x") else "0x0"
+                    symbols[symbol_name] = address
+                    
+        except subprocess.CalledProcessError as e:
+            raise RuntimeError(f"Failed to get dynamic symbols: {e.stderr}") from e
+        
+        return symbols
+    
+    def compare_disassembly(self, path1: Union[str, Path], path2: Union[str, Path]) -> Dict[str, List[str]]:
         disasm1 = self.disassemble(path1).splitlines()
         disasm2 = self.disassemble(path2).splitlines()
         
@@ -133,7 +171,7 @@ class ObjdumpDisassembler:
         output_path = Path(output_path)
         output_path.write_text(disassembly)
     
-    def disassemble_multiple(self, paths: list[Union[str, Path]]) -> dict[str, str]:
+    def disassemble_multiple(self, paths: List[Union[str, Path]]) -> Dict[str, str]:
         results = {}
         for path in paths:
             try:
@@ -142,7 +180,7 @@ class ObjdumpDisassembler:
                 results[str(path)] = f"ERROR: {e}"
         return results
 
-def disassemble_bytes(code_bytes: bytes, architecture: str = "i386") -> str:
+def disassemble_bytes(code_bytes: bytes, architecture: str = "i386:x86-64") -> str:
     with tempfile.NamedTemporaryFile(delete=False, suffix=".bin") as tmp:
         tmp.write(code_bytes)
         tmp_path = tmp.name
@@ -155,10 +193,12 @@ def disassemble_bytes(code_bytes: bytes, architecture: str = "i386") -> str:
             check=True
         )
         return result.stdout
+    except subprocess.CalledProcessError as e:
+        raise RuntimeError(f"objdump failed on byte disassembly: {e.stderr}") from e
     finally:
         os.unlink(tmp_path)
 
-def analyze_binary_security(path: Union[str, Path]) -> dict[str, bool]:
+def analyze_binary_security(path: Union[str, Path]) -> Dict[str, bool]:
     path = Path(path)
     if not path.exists():
         raise FileNotFoundError(f"File not found: {path}")
@@ -166,11 +206,14 @@ def analyze_binary_security(path: Union[str, Path]) -> dict[str, bool]:
     security_features = {
         "nx_bit": False,
         "pie": False,
-        "relro": False,
+        "full_relro": False,
         "canary": False
     }
     
     try:
+        if not shutil.which("readelf"):
+            raise RuntimeError("readelf not found. Install binutils package.")
+        
         result = subprocess.run(
             ["readelf", "-l", str(path)],
             capture_output=True,
@@ -178,8 +221,11 @@ def analyze_binary_security(path: Union[str, Path]) -> dict[str, bool]:
             check=True
         )
         
-        if "GNU_STACK" in result.stdout and "RWE" not in result.stdout:
-            security_features["nx_bit"] = True
+        if "GNU_STACK" in result.stdout:
+            for line in result.stdout.splitlines():
+                if "GNU_STACK" in line and "RWE" not in line and "RW" in line:
+                    security_features["nx_bit"] = True
+                    break
         
         result = subprocess.run(
             ["readelf", "-h", str(path)],
@@ -188,8 +234,23 @@ def analyze_binary_security(path: Union[str, Path]) -> dict[str, bool]:
             check=True
         )
         
-        if "Type: DYN" in result.stdout:
-            security_features["pie"] = True
+        for line in result.stdout.splitlines():
+            if "Type:" in line and "DYN" in line:
+                security_features["pie"] = True
+                break
+        
+        result = subprocess.run(
+            ["readelf", "-l", str(path)],
+            capture_output=True,
+            text=True,
+            check=True
+        )
+        
+        has_gnu_relro = False
+        for line in result.stdout.splitlines():
+            if "GNU_RELRO" in line:
+                has_gnu_relro = True
+                break
         
         result = subprocess.run(
             ["readelf", "-d", str(path)],
@@ -198,25 +259,83 @@ def analyze_binary_security(path: Union[str, Path]) -> dict[str, bool]:
             check=True
         )
         
-        if "BIND_NOW" in result.stdout:
-            security_features["relro"] = True
+        has_bind_now = "BIND_NOW" in result.stdout
         
+        security_features["full_relro"] = has_gnu_relro and has_bind_now
+        
+        try:
+            symbols = subprocess.run(
+                ["objdump", "-t", str(path)],
+                capture_output=True,
+                text=True,
+                check=True
+            )
+            if "__stack_chk_fail" in symbols.stdout:
+                security_features["canary"] = True
+            else:
+                dyn_symbols = subprocess.run(
+                    ["objdump", "-T", str(path)],
+                    capture_output=True,
+                    text=True,
+                    check=True
+                )
+                if "__stack_chk_fail" in dyn_symbols.stdout:
+                    security_features["canary"] = True
+        except subprocess.CalledProcessError:
+            pass
+            
+    except subprocess.CalledProcessError as e:
+        raise RuntimeError(f"Security analysis failed: {e.stderr}") from e
+    
+    return security_features
+
+def get_program_headers(path: Union[str, Path]) -> List[Dict[str, str]]:
+    path = Path(path)
+    if not path.exists():
+        raise FileNotFoundError(f"File not found: {path}")
+    
+    headers = []
+    try:
         result = subprocess.run(
-            ["objdump", "-d", str(path)],
+            ["readelf", "-l", str(path)],
             capture_output=True,
             text=True,
             check=True
         )
         
-        if "__stack_chk_fail" in result.stdout:
-            security_features["canary"] = True
-            
+        current_header = {}
+        for line in result.stdout.splitlines():
+            if line.startswith("Program Headers:"):
+                continue
+            if line.startswith("Type") and "Offset" in line:
+                continue
+            if line.strip() and not line.startswith("Section to Segment"):
+                parts = line.split()
+                if len(parts) >= 2 and parts[0] in ["PHDR", "INTERP", "LOAD", "DYNAMIC", "NOTE", "GNU_STACK", "GNU_RELRO", "GNU_PROPERTY"]:
+                    if current_header:
+                        headers.append(current_header)
+                    current_header = {"type": parts[0]}
+                    for i, part in enumerate(parts[1:]):
+                        if i == 0:
+                            current_header["offset"] = part
+                        elif i == 1:
+                            current_header["vaddr"] = part
+                        elif i == 2:
+                            current_header["paddr"] = part
+                        elif i == 3:
+                            current_header["filesz"] = part
+                        elif i == 4:
+                            current_header["memsz"] = part
+                        elif i == 5:
+                            current_header["flags"] = part
+                        elif i == 6:
+                            current_header["align"] = part
+        if current_header:
+            headers.append(current_header)
     except subprocess.CalledProcessError as e:
-        raise RuntimeError(f"Security analysis failed: {e.stderr}") from e
-    except FileNotFoundError as e:
-        raise RuntimeError("readelf not found. Install binutils package.") from e
+        raise RuntimeError(f"Failed to get program headers: {e.stderr}") from e
     
-    return security_features
+    return headers
 
 if __name__ == "__main__":
     disassembler = ObjdumpDisassembler()
@@ -241,3 +360,9 @@ if __name__ == "__main__":
     security = analyze_binary_security("/bin/ls")
     for feature, enabled in security.items():
         print(f"  {feature}: {enabled}")
+    
+    print("\n" + "="*50)
+    print("Program headers:")
+    headers = get_program_headers("/bin/ls")
+    for header in headers[:5]:
+        print(f"  {header}")
